@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">AI Usage Demo</string>
+    <string name="sentry_id">https://40f793a74297e8538f8745a021113e0a@o4512101323571200.ingest.us.sentry.io/4512123552268288</string>
 </resources>
