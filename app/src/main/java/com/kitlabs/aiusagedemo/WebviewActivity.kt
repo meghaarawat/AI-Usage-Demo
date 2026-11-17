@@ -2,13 +2,23 @@ package com.kitlabs.aiusagedemo
 
 import android.os.Bundle
 import android.util.Log
+import android.widget.TextView
+import android.widget.Toast
 import android.webkit.ConsoleMessage
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 
 class WebviewActivity : AppCompatActivity() {
@@ -20,58 +30,149 @@ class WebviewActivity : AppCompatActivity() {
     private val amount = 25.00
     private val url = "https://d16main.meevodev.com"
 
+    // Booking values for /ob/Prepay. Fill these in before testing.
+    private val prepayClientId = "2b0014c2-1d55-4be1-929c-b4f0004e3e8b" // BookRequest.ClientId
+    private val prepayClientGlobalId = "2b0014c2-1d55-4be1-929c-b4f0004e3e8b" // ClientGlobalId
+    private val prepayServiceId = "65c79d7c-268f-496c-9cae-ac6100370618" // BookRequest.Services[0].ServiceId
+    private val prepayEmployeeId = "c13fa838-cd28-4af7-8b42-ac610037a4a9" // Services[0].EmployeeId
+    private val prepayStartTime = "2026-11-04T11:00:00" // Services[0].StartTime
+    private val prepayOpeningId = "6314b0f2-2ffd-4447-8398-c1edc5000d33" // Services[0].OpeningId
+    private val prepayAppointmentDate = "2026-11-04T00:00:00" // BookRequest.AppointmentDate
+
+    // Called from the page when meevo-pay-deposit emits paymentAccountCreated
+    inner class PaymentBridge {
+        @JavascriptInterface
+        fun onPaymentAccountCreated(detailJson: String) {
+            val detail = JSONObject(detailJson)
+            CoroutineScope(Dispatchers.IO).launch {
+                callPrepay(
+                    paymentAccountId = detail.getString("paymentAccountId"),
+                    encryptedSecurityCode = detail.optString("encryptedSecurityCode")
+                )
+            }
+        }
+    }
+
+    private fun callPrepay(paymentAccountId: String, encryptedSecurityCode: String) {
+        val service = JSONObject()
+            .put("ServiceId", prepayServiceId)
+            .put("EmployeeId", prepayEmployeeId)
+            .put("StartTime", prepayStartTime)
+            .put("OpeningId", prepayOpeningId)
+            .put("NonRequest", true)
+            .put("IsGuest", false)
+            .put("Answers", JSONArray())
+
+        val bookRequest = JSONObject()
+            .put("ClientId", prepayClientId)
+            .put("LocationId", locationId.toInt())
+            .put("AppointmentDate", prepayAppointmentDate)
+            .put("Answers", JSONArray())
+            .put("Services", JSONArray().put(service))
+
+        val body = JSONObject()
+            .put("BookRequest", bookRequest)
+            .put("PaymentAccountId", paymentAccountId)
+            .put("ClientGlobalId", prepayClientGlobalId)
+            .put("EncryptedSecurityCode", encryptedSecurityCode)
+            .put("RetainCardOnFile", false)
+
+        val conn = URL("$url/clientapp/ob/Prepay").openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Authorization", "Bearer ${BuildConfig.TOKEN}")
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+            val code = conn.responseCode
+            val response = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.readText().orEmpty()
+            Log.d("WebviewM", "Prepay HTTP $code: $response")
+
+            // A booked appointment returns no warnings or errors in the body
+            val booked = code in 200..299 && !response.contains("\"warnings\"") && !response.contains("\"responseStatus\"")
+            showMessage(if (booked) "Appointment booked successfully" else "Booking failed. Check Logcat for details.")
+        } catch (e: Exception) {
+            Log.e("WebviewM", "Prepay failed", e)
+            showMessage("Booking failed: ${e.message}")
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun showMessage(message: String) {
+        runOnUiThread {
+            findViewById<TextView>(R.id.tv).text = message
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_webview)
         web = findViewById(R.id.webView)
 
         val html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pay deposit</title>
+  <script src="$url/lib/meevo-pay-deposit.js"></script>
+</head>
+<body>
+  <meevo-pay-deposit
+    api-base-url="$url/clientapp"
+    bearer-token="${BuildConfig.TOKEN}"
+    tenant-id="$tenantId"
+    location-id="$locationId"
+    recaptcha-internal-key="$siteKey"
+    transaction-amount="${"%.2f".format(amount)}"
+    full-billing-address="true"
+  ></meevo-pay-deposit>
 
-        <script src="$url/lib/meevo-pay-deposit.js"></script>
-    </head>
+  <button id="pay-deposit" disabled>Pay deposit</button>
 
-    <body>
-        <h2>Complete Payment</h2>
+  <script>
+    var el = document.querySelector('meevo-pay-deposit');
+    var payBtn = document.getElementById('pay-deposit');
+    var required = ['api-base-url', 'bearer-token', 'tenant-id', 'location-id', 'recaptcha-internal-key'];
 
-        <meevo-pay-deposit
-            id="pay"
-            api-base-url="$url"
-            bearer-token="${BuildConfig.TOKEN}"
-            tenant-id="$tenantId"
-            location-id="$locationId"
-            recaptcha-internal-key="$siteKey"
-            transaction-amount="${"%.2f".format(Locale.US, amount)}"
-            show-pay-button="true">
-        </meevo-pay-deposit>
+    el.addEventListener('paymentFailed', function (e) {
+      console.error('Payment failed', JSON.stringify(e.detail));
+    });
 
-        <script>
-            customElements.whenDefined('meevo-pay-deposit').then(function () {
-                const el = document.getElementById('pay');
+    var pageLoaded = false;
+    el.addEventListener('hostedPageLoaded', function () {
+      pageLoaded = true;
+      console.log('hostedPageLoaded');
+    });
+    el.addEventListener('validityChanged', function (e) { payBtn.disabled = !e.detail; });
 
-                console.log('Component initialized');
-                console.log('Submit method:', typeof el.submit);
+    payBtn.addEventListener('click', function () { el.submit(); });
 
-                [
-                    'hostedPageLoaded',
-                    'validityChanged',
-                    'cardMetadataChanged',
-                    'paymentAccountCreated',
-                    'paymentFailed'
-                ].forEach(function (name) {
-                    el.addEventListener(name, function (event) {
-                        console.log('Payment event:', name, event.detail);
-                    });
-                });
-            });
-        </script>
-    </body>
-    </html>
-""".trimIndent()
+    el.addEventListener('paymentAccountCreated', function (e) {
+      console.log('paymentAccountCreated', JSON.stringify(e.detail));
+      Android.onPaymentAccountCreated(JSON.stringify(e.detail));
+    });
+
+    // The component fails silently when a required attribute is missing, so report it here
+    var missing = required.filter(function (name) { return !el.getAttribute(name); });
+    if (missing.length) {
+      console.error('meevo-pay-deposit missing attributes: ' + missing.join(', '));
+    }
+
+    setTimeout(function () {
+      if (!pageLoaded) {
+        console.error('hostedPageLoaded not received after 30s; check /ob/HostedPageData and reCAPTCHA');
+      }
+    }, 30000);
+  </script>
+</body>
+</html>
+"""
 
         WebView.setWebContentsDebuggingEnabled(true)
         web.webChromeClient = object : WebChromeClient() {
@@ -87,6 +188,7 @@ class WebviewActivity : AppCompatActivity() {
         }
         web.settings.javaScriptEnabled = true
         web.settings.domStorageEnabled = true
+        web.addJavascriptInterface(PaymentBridge(), "Android")
         web.loadDataWithBaseURL(
             url,
             html,
